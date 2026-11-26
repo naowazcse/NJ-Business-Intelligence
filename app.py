@@ -25,6 +25,23 @@ if not st.session_state.auth:
 
 st.title("vivo NJ Region - 30 Reports + Virtual Shop MIS")
 
+VIRTUAL_SHOP_LIST = [
+    "(VS) NJ - Jahanara Enterprise (Gopalganj)",
+    "(VS) NJ - JSP Mobile Shop (Munshiganj City)",
+    "(VS) NJ - Kushtia Distribution (Kushtia)",
+    "(VS) NJ - M/s Khan Distribution (Faridpur)",
+    "(VS) NJ - M/S Mridha traders(Gopalganj Thana 2)",
+    "(VS) NJ - Maa Telecom (Madaripur)",
+    "(VS) NJ - MD Mahamudul Hasan Enterprise (Rajbari 1)",
+    "(VS) NJ - Mobile link (Narayanganj)",
+    "(VS) NJ - Modern Telecom (Shariatpur)",
+    "(VS) NJ - Pigeon International (Kushtia City)",
+    "(VS) NJ - Safa Enterprise (Narayanganj County-02)",
+    "(VS) NJ - Sajid Telecom Thana (Munshiganj)",
+    "(VS) NJ - SK International(Gopalganj)",
+    "(VS) NJ - Vai Vai Telecom (Narayanganj County-01)",
+]
+
 with st.sidebar:
   st.header("Upload Files")
   sales_up = st.file_uploader("Sales File (.xlsx)", type=["xlsx", "xls"])
@@ -100,6 +117,9 @@ def nnum(s):
   ).fillna(0.0)
 
 
+VIRTUAL_SHOP_KEYS = set(nkey(VIRTUAL_SHOP_LIST).tolist())
+
+
 def find_col(df, kws):
   if df is None or df.empty:
     return None
@@ -133,6 +153,7 @@ def read_smart_xlsx(raw, sheet=None):
       "shop name",
       "model name",
       "model",
+      "version",
       "quantity",
       "qty",
       "stock",
@@ -302,19 +323,27 @@ def enrich_df(d, shop_df):
   else:
     d["_model_ver"] = d["_model_only"]
 
+  in_vs_list = nkey(d["_shop_disp"]).isin(VIRTUAL_SHOP_KEYS)
   vs_c = find_col(d, ["vs", "vivo store", "shop type", "store type"])
   if vs_c:
-    d["_is_vs"] = (
+    vs_flag = (
         ndisp(d[vs_c])
         .str.lower()
-        .str.contains(r"\bvs\b|vivo store|virtual|yes|1|true", regex=True)
+        .str.contains(
+            r"(?:^|[^a-z0-9])vs(?:[^a-z0-9]|$)|vivo store|virtual|yes|1|true",
+            regex=True,
+        )
     )
+    d["_is_vs"] = in_vs_list | vs_flag
   else:
-    d["_is_vs"] = (
+    vs_name_flag = (
         d["_shop_disp"]
         .str.lower()
-        .str.contains(r"\(vs\)|\bvs\b|vivo store|virtual", regex=True)
+        .str.contains(
+            r"(?:^|[^a-z0-9])vs(?:[^a-z0-9]|$)|vivo store|virtual", regex=True
+        )
     )
+    d["_is_vs"] = in_vs_list | vs_name_flag
 
   dc = find_col(d, ["sales date", "date", "billing date", "create time"])
   if dc:
@@ -515,13 +544,13 @@ def run_engine(q, mode_sel, s_raw, i_raw, t_recs, days_p, vba_lim):
   vba_s = find_col(
       s_df, ["vba name", "vba_name", "vba", "promoter", "ba name"]
   )
-  mod_s = find_col(s_df, ["model name", "model_name", "model"])
-  mod_i = find_col(i_df, ["model name", "model_name", "model"])
   area_s = find_col(s_df, ["business area", "area", "zone", "region"])
   mkt_s = find_col(s_df, ["market", "upazola", "thana", "district", "bazar"])
 
   is_virt = (
-      "virtual" in q or bool(re.search(r"\bvs\b", q)) or "vivo store" in q
+      "virtual" in q
+      or bool(re.search(r"(?:^|[^a-z0-9])vs(?:[^a-z0-9]|$)", q))
+      or "vivo store" in q
   )
   is_ver = "version" in q or "ver" in q
   is_mod = "model" in q
@@ -697,8 +726,8 @@ def run_engine(q, mode_sel, s_raw, i_raw, t_recs, days_p, vba_lim):
     return res, xc, "Qty", "Yearly Sales Analysis", "R29: Yearly Sales Analysis"
 
   if is_turn and has_s and has_i:
-    su = s_df[s_df["_is_vs"]] if (is_virt and s_df["_is_vs"].any()) else s_df
-    iu = i_df[i_df["_is_vs"]] if (is_virt and i_df["_is_vs"].any()) else i_df
+    su = s_df[s_df["_is_vs"]] if is_virt else s_df
+    iu = i_df[i_df["_is_vs"]] if is_virt else i_df
     if "md" in q and (md_s or md_i):
       ds, di, rid = (
           [("MD_Name", md_s or md_i)],
@@ -730,8 +759,8 @@ def run_engine(q, mode_sel, s_raw, i_raw, t_recs, days_p, vba_lim):
       and has_s
       and has_i
   ):
-    su = s_df[s_df["_is_vs"]] if (is_virt and s_df["_is_vs"].any()) else s_df
-    iu = i_df[i_df["_is_vs"]] if (is_virt and i_df["_is_vs"].any()) else i_df
+    su = s_df[s_df["_is_vs"]] if is_virt else s_df
+    iu = i_df[i_df["_is_vs"]] if is_virt else i_df
     if "md" in q and (md_s or md_i):
       ds, di, rid = (
           [("MD_Name", md_s or md_i)],
@@ -751,34 +780,37 @@ def run_engine(q, mode_sel, s_raw, i_raw, t_recs, days_p, vba_lim):
     res, xc = merge_stock_sales(iu, su, di, ds, days_p, "vs_stock")
     return res, xc, "Stock_Qty", f"{di[0][0]} Sales Vs Stock", rid
 
-  if any(k in q for k in ["stock", "inventory", "virtual"]) and has_i:
-    iu = i_df[i_df["_is_vs"]] if (is_virt and i_df["_is_vs"].any()) else i_df
+  if any(k in q for k in ["stock", "inventory", "virtual", "vs"]) and has_i:
+    iu = i_df[i_df["_is_vs"]] if is_virt else i_df
     if "md" in q and not ("shop" in q or "store" in q or is_virt):
       dims, rid = [("MD_Name", md_i or "_sk")], "R1: MD Stock"
     else:
       sh_col_name = "Virtual_Shop_Name" if is_virt else "Shop_Name"
       dims = [(sh_col_name, sh_i or "_sk")]
-      if is_ver:
+      if is_ver and is_mod:
         dims.append(("Model_Name", "_model_only"))
         dims.append(("Version", "_ver_only"))
         rid = (
-            "R5: Virtual Shop Model & Version Wise Stock"
+            "R5: (VS) Shop Model Version Wise Stock"
             if is_virt
-            else "R5: Model & Version Wise Shop Stock"
+            else "R5: Shop Model Version Wise Stock"
+        )
+      elif is_ver:
+        dims.append(("Version", "_ver_only"))
+        rid = (
+            "R5: (VS) Shop Version Wise Stock"
+            if is_virt
+            else "R5: Shop Version Wise Stock"
         )
       elif is_mod:
         dims.append(("Model_Name", "_model_only"))
         rid = (
-            "R4: Virtual Shop Model Wise Stock"
+            "R4: (VS) Shop Model Wise Stock"
             if is_virt
-            else "R4: Model Wise Shop Stock"
+            else "R4: Shop Model Wise Stock"
         )
       else:
-        rid = (
-            "R2: Virtual Shop Name Wise Stock"
-            if is_virt
-            else "R3: Shop Name Wise Stock"
-        )
+        rid = "(VS) Shop Stock" if is_virt else "Shop Stock"
     ig, ik, id_ = agg_dims(iu, dims)
     ig = ig.rename(columns={"Qty": "Stock_Qty", "Amount": "Stock_Value"})
     res, xc = finalize(
@@ -863,107 +895,4 @@ def run_engine(q, mode_sel, s_raw, i_raw, t_recs, days_p, vba_lim):
       sg["Achievement_%"] = np.where(
           sg["Target_Qty"] > 0,
           np.round((sg["Sales_Qty"] / sg["Target_Qty"]) * 100, 2),
-          0.0,
-      )
-    if "low" in q and "vba" in q:
-      sg = sg[sg["Sales_Qty"] <= vba_lim]
-    res, xc = finalize(
-        sg,
-        sk,
-        sd,
-        "Sales_Qty",
-        False,
-        sd + ["Sales_Qty", "Target_Qty", "Achievement_%", "Sales_Amount"],
-    )
-    return res, xc, "Sales_Qty", f"{' + '.join(sd)} Sales", rid
-
-  if has_i:
-    ig, ik, id_ = agg_dims(i_df, [("Shop_Name", sh_i or "_sk")])
-    ig = ig.rename(columns={"Qty": "Stock_Qty"})
-    res, xc = finalize(ig, ik, id_, "Stock_Qty", False, id_ + ["Stock_Qty"])
-    return res, xc, "Stock_Qty", "Inventory Stock", "Inventory Fallback"
-
-  return None, None, None, "Report", "No Data"
-
-
-st.markdown("### Command Box")
-cmd = st.text_input(
-    "Enter command",
-    placeholder=(
-        "Virtual shop stock model version wise / Virtual shop name wise stock"
-    ),
-)
-q = (cmd or "").strip().lower()
-days_p = get_days(df_sales)
-report, x_col, y_col, c_title, matched_rule = None, None, None, "Report", "None"
-
-try:
-  aq = (
-      q
-      if q
-      else (
-          "se wise stock"
-          if report_mode == "Stock & Inventory"
-          else "se wise sales"
-      )
-  )
-  report, x_col, y_col, c_title, matched_rule = run_engine(
-      aq, report_mode, df_sales, df_inv, target_recs, days_p, low_vba_lim
-  )
-  if report is not None and not report.empty and q:
-    mt = re.search(r"\btop\s+(\d+)\b", q)
-    mb = re.search(r"\bbottom\s+(\d+)\b", q)
-    if mt and y_col in report.columns:
-      report = report.sort_values(by=y_col, ascending=False).head(
-          int(mt.group(1))
-      )
-    elif mb and y_col in report.columns:
-      report = report.sort_values(by=y_col, ascending=True).head(
-          int(mb.group(1))
-      )
-except Exception as e:
-  st.warning(f"Note: {e}")
-
-if report is not None and not report.empty:
-  st.caption(f"Rule: **{matched_rule}** | Mode: **{report_mode}**")
-  c1, c2 = st.columns(2)
-  with c1:
-    st.subheader("Report Table")
-    st.dataframe(report, use_container_width=True)
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-      report.to_excel(w, index=False, sheet_name="Report")
-    st.download_button(
-        "Download Excel (.xlsx)",
-        data=buf.getvalue(),
-        file_name="vivo_nj_reports.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
-    )
-  with c2:
-    st.subheader("Chart")
-    if x_col and y_col and x_col in report.columns and y_col in report.columns:
-      st.plotly_chart(
-          px.bar(report.head(25), x=x_col, y=y_col, text=y_col, title=c_title),
-          use_container_width=True,
-      )
-
-with st.expander("Target File Mapping"):
-  if target_recs:
-    st.write([
-        {
-            "Sheet": r["sheet"],
-            "Dim": r["dim"],
-            "Key_Col": r["key_col"],
-            "Target_Col": r["val_col"],
-            "Keys": len(r["map"]),
-        }
-        for r in target_recs
-    ])
-  else:
-    st.caption("Upload Target file to inspect sheet mapping.")
-
-if pbi_link:
-  st.divider()
-  st.components.v1.iframe(pbi_link, height=600, scrolling=True)
+          0
