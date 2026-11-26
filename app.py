@@ -172,7 +172,10 @@ def detect_dim_tag(text):
       for k in ["se 名称", "se name", "se_name", "sales executive", "se"]
   ):
     return "se"
-  if any(k in tl for k in ["store code", "商店代码", "store_code", "shop name", "store name"]):
+  if any(
+      k in tl
+      for k in ["store code", "商店代码", "store_code", "shop name", "store name"]
+  ):
     return "shop"
   if any(k in tl for k in ["model name", "model_name", "model"]):
     return "model"
@@ -259,7 +262,7 @@ def enrich_df(d, shop_df):
   else:
     d["_sk"] = ""
 
-  shop_c = find_col(d, ["store name", "shop name", "商店名称", "store name"])
+  shop_c = find_col(d, ["store name", "shop name", "商店名称"])
   if shop_c:
     d = drop_total_rows(d, shop_c)
     d["_shop_disp"] = ndisp(d[shop_c]).replace("", "Unmapped")
@@ -411,7 +414,9 @@ def match_target_series(disp_series, recs, q, dim_hint=""):
   return keys.map(lambda k: float(best.get(k, 0.0)))
 
 
-def make_label_and_sort(df, k_cols, d_cols, sort_col, asc=False, priority_cols=None):
+def make_label_and_sort(
+    df, k_cols, d_cols, sort_col, asc=False, priority_cols=None
+):
   out = df.copy()
   if len(d_cols) > 1:
     out["Label"] = out[d_cols].astype(str).agg(" | ".join, axis=1)
@@ -428,12 +433,16 @@ def make_label_and_sort(df, k_cols, d_cols, sort_col, asc=False, priority_cols=N
   return out, x_c
 
 
-def calc_stock_sales_merge(i_df, s_df, dims_i, dims_s, days_p, mode_type="turnover"):
+def calc_stock_sales_merge(
+    i_df, s_df, dims_i, dims_s, days_p, mode_type="turnover"
+):
   sg, sk, sd = agg_by_dims(s_df, dims_s)
   ig, ik, id_ = agg_by_dims(i_df, dims_i)
   sg = sg.rename(columns={"Qty": "Sales_Qty", "Amount": "Sales_Amount"})
   ig = ig.rename(columns={"Qty": "Stock_Qty"})
-  m = pd.merge(ig, sg, left_on=ik, right_on=sk, how="outer", suffixes=("_i", "_s"))
+  m = pd.merge(
+      ig, sg, left_on=ik, right_on=sk, how="outer", suffixes=("_i", "_s")
+  )
   m["Stock_Qty"] = nnum(m["Stock_Qty"])
   m["Sales_Qty"] = nnum(m["Sales_Qty"])
 
@@ -466,102 +475,10 @@ def calc_stock_sales_merge(i_df, s_df, dims_i, dims_s, days_p, mode_type="turnov
         id_,
         "Turnover_Days",
         False,
-        priority_cols=id_ + ["Turnover_Days", "Stock_Qty", "Sales_Qty", "Daily_Sales"],
+        priority_cols=id_
+        + ["Turnover_Days", "Stock_Qty", "Sales_Qty", "Daily_Sales"],
     )
   else:
     m["Stock_Gap"] = m["Stock_Qty"] - m["Sales_Qty"]
     m["Stock_Need"] = np.maximum(m["Sales_Qty"] - m["Stock_Qty"], 0.0)
-    sort_c = "Stock_Need" if "need" in mode_type else "Stock_Qty"
-    return make_label_and_sort(
-        m,
-        ik + sk,
-        id_,
-        sort_c,
-        False,
-        priority_cols=id_ + ["Stock_Qty", "Sales_Qty", "Stock_Need", "Stock_Gap"],
-    )
-
-
-def run_30_plus_engine(q, mode_sel, s_raw, i_raw, t_recs, days_p, low_vba_lim):
-  s_df = apply_text_filters(s_raw, q)
-  i_df = apply_text_filters(i_raw, q)
-  has_s = s_df is not None and not s_df.empty
-  has_i = i_df is not None and not i_df.empty
-  if not has_s and not has_i:
-    return None, None, None, "Report", "No Data"
-
-  shop_c_s = "_shop_disp" if (has_s and "_shop_disp" in s_df.columns) else find_col(s_df, ["store name", "shop name", "商店名称", "store code", "商店代码"])
-  shop_c_i = "_shop_disp" if (has_i and "_shop_disp" in i_df.columns) else find_col(i_df, ["store name", "shop name", "商店名称", "store code", "商店代码"])
-  md_c_s = find_col(s_df, ["md name", "md code", "md"])
-  md_c_i = find_col(i_df, ["md name", "md code", "md"])
-  se_c_s = find_col(s_df, ["se 名称", "se name", "se_name", "se"])
-  asm_c_s = find_col(s_df, ["asm name", "asm"])
-  vba_c_s = find_col(s_df, ["vba name", "vba_name", "vba", "promoter", "ba name"])
-  mod_c_s = find_col(s_df, ["model name", "model_name", "model"])
-  mod_c_i = find_col(i_df, ["model name", "model_name", "model"])
-  area_c_s = find_col(s_df, ["business area", "area", "zone", "region"])
-  mkt_c_s = find_col(s_df, ["market", "upazola", "thana", "district", "bazar"])
-
-  is_virtual = "virtual" in q or bool(re.search(r"\bvs\b", q)) or "vivo store" in q
-  is_ver = "version" in q or "ver" in q
-  is_mod = "model" in q or "মডেল" in q
-  is_turn = any(k in q for k in ["turnover", "turn over", "টার্নওভার"])
-  is_growth = any(k in q for k in ["growth", "degrowth", "de-growth", "two month", "2 month"])
-
-  if mode_sel == "Stock & Inventory Mode" and not is_turn:
-    q = f"{q} stock"
-  elif mode_sel == "Turnover Days Mode":
-    is_turn = True
-  elif mode_sel == "Growth / Degrowth Mode":
-    is_growth = True
-
-  # Extra: MD Stock Need
-  if "need" in q and ("md" in q or "stock" in q) and has_s and has_i:
-    d_s = [("MD_Name", md_c_s or md_c_i or "_sk")]
-    d_i = [("MD_Name", md_c_i or md_c_s or "_sk")]
-    res, x_c = calc_stock_sales_merge(i_df, s_df, d_i, d_s, days_p, mode_type="need")
-    return res, x_c, "Stock_Need", "MD Stock Need Analysis", "Extra: MD Stock Need"
-
-  # R22: Zero Sales Shop List
-  if "zero sales" in q:
-    base = pd.DataFrame()
-    if has_i and "_sk" in i_df.columns:
-      base = i_df[["_sk", shop_c_i]].drop_duplicates(subset=["_sk"]).rename(columns={shop_c_i: "Store_Name"})
-    elif has_s and "_sk" in s_df.columns:
-      base = s_df[["_sk", shop_c_s]].drop_duplicates(subset=["_sk"]).rename(columns={shop_c_s: "Store_Name"})
-    if has_s and not base.empty:
-      sold = s_df.groupby("_sk", as_index=False)["_qty"].sum().rename(columns={"_qty": "Sales_Qty"})
-      m = pd.merge(base, sold, on="_sk", how="left")
-      m["Sales_Qty"] = nnum(m["Sales_Qty"])
-      res = m[m["Sales_Qty"] <= 0].drop(columns=["_sk"], errors="ignore")
-      return res, "Store_Name", "Sales_Qty", "Zero Sales Shop List", "R22: Zero Sales Shop List"
-
-  # R23: Zero Stock Shop List
-  if "zero stock" in q:
-    base = pd.DataFrame()
-    if has_s and "_sk" in s_df.columns:
-      base = s_df[["_sk", shop_c_s]].drop_duplicates(subset=["_sk"]).rename(columns={shop_c_s: "Store_Name"})
-    elif has_i and "_sk" in i_df.columns:
-      base = i_df[["_sk", shop_c_i]].drop_duplicates(subset=["_sk"]).rename(columns={shop_c_i: "Store_Name"})
-    if has_i and not base.empty:
-      stk = i_df.groupby("_sk", as_index=False)["_qty"].sum().rename(columns={"_qty": "Stock_Qty"})
-      m = pd.merge(base, stk, on="_sk", how="left")
-      m["Stock_Qty"] = nnum(m["Stock_Qty"])
-      res = m[m["Stock_Qty"] <= 0].drop(columns=["_sk"], errors="ignore")
-      return res, "Store_Name", "Stock_Qty", "Zero Stock Shop List", "R23: Zero Stock Shop List"
-
-  # R21: SE Wise Hire Purchase Sales
-  if ("hire" in q or "hp" in q or "installment" in q) and has_s:
-    hp_c = find_col(s_df, ["hire", "hp", "payment", "pay type", "order type", "channel"])
-    sub = s_df.copy()
-    if hp_c:
-      mask = ndisp(sub[hp_c]).str.lower().str.contains("hire|hp|installment", regex=True)
-      if mask.any():
-        sub = sub[mask]
-    sg, sk, sd = agg_by_dims(sub, [("SE_Name", se_c_s or shop_c_s or "_sk")])
-    sg = sg.rename(columns={"Qty": "HP_Sales_Qty", "Amount": "HP_Sales_Amount"})
-    res, x_c = make_label_and_sort(sg, sk, sd, "HP_Sales_Qty", False, priority_cols=sd + ["HP_Sales_Qty", "HP_Sales_Amount"])
-    return res, x_c, "HP_Sales_Qty", "SE Wise Hire Purchase Sales", "R21: SE Wise Hire Purchase Sales"
-
-  # R10: SE Wise Shop Coverage Model Version Wise
-  if "coverage" in
+    sort_c = "Stock_Need" if
