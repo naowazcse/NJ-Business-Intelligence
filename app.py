@@ -71,6 +71,10 @@ def norm_key(series):
   )
 
 
+def norm_compact_key(series):
+  return norm_key(series).str.replace(r"\s+", "", regex=True)
+
+
 def norm_disp(series):
   return (
       series.fillna("")
@@ -116,10 +120,7 @@ def load_shop_df(file):
   store_col = find_col(df, ["store code", "商店代码", "store_code"])
   if not store_col:
     return None
-  keep = [store_col]
-  for c in df.columns:
-    if c not in keep:
-      keep.append(c)
+  keep = [store_col] + [c for c in df.columns if c != store_col]
   out = df[keep].copy()
   out["_store_key"] = norm_key(out[store_col])
   out[store_col] = norm_disp(out[store_col])
@@ -128,43 +129,87 @@ def load_shop_df(file):
   )
 
 
-def load_target_df(file):
+def load_target_maps(file):
+  """Target ফাইলের সব শিট ও হেডার স্ক্যান করে ASM, SE, Shop ও Model অনুযায়ী Target ম্যাপ তৈরি করে"""
   if file is None:
-    return None
+    return {}
   raw = file.getvalue()
   xls = pd.ExcelFile(io.BytesIO(raw))
+  maps = {}
+
   for sh in xls.sheet_names:
-    tmp = clean_cols(pd.read_excel(io.BytesIO(raw), sheet_name=sh))
+    try:
+      tmp_raw = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
+    except Exception:
+      continue
+    if tmp_raw is None or tmp_raw.empty:
+      continue
+
+    hdr_idx = 0
+    for r_i in range(min(15, len(tmp_raw))):
+      row_str = " ".join(str(x).lower() for x in tmp_raw.iloc[r_i].fillna(""))
+      if any(
+          k in row_str
+          for k in [
+              "target",
+              "টার্গেট",
+              "asm",
+              "se ",
+              "se_",
+              "store code",
+              "商店代码",
+          ]
+      ):
+        hdr_idx = r_i
+        break
+
+    tmp = tmp_raw.iloc[hdr_idx:].copy()
+    tmp.columns = [str(x).strip() for x in tmp.iloc[0]]
+    tmp = clean_cols(tmp.iloc[1:].reset_index(drop=True))
     if tmp is None or tmp.empty:
       continue
-    if all(str(c).startswith("Unnamed") for c in tmp.columns) and len(tmp) > 0:
-      tmp.columns = [str(x).strip() for x in tmp.iloc[0]]
-      tmp = clean_cols(tmp.iloc[1:].reset_index(drop=True))
-    key_col = find_col(
+
+    tgt_col = find_col(
         tmp,
         [
-            "se 名称",
-            "se name",
-            "se_name",
-            "sales executive",
-            "store code",
-            "商店代码",
-            "md name",
-            "model",
-            "name",
+            "total target",
+            "qty target",
+            "target qty",
+            "target",
+            "টার্গেট",
+            "tgt",
         ],
     )
-    tgt_col = find_col(
-        tmp, ["target", "টার্গেট", "tgt", "achievement", "qty"]
-    )
-    if key_col and tgt_col:
-      out = pd.DataFrame({
-          "_tgt_key": norm_key(tmp[key_col]),
-          "Target_Qty": to_num(tmp[tgt_col]),
-      })
-      out = out[out["_tgt_key"] != ""]
-      return out.groupby("_tgt_key", as_index=False)["Target_Qty"].sum()
-  return None
+    if not tgt_col:
+      continue
+
+    tgt_vals = to_num(tmp[tgt_col])
+
+    dim_specs = [
+        ("asm", ["asm name", "asm_name", "asm", "এএসএম"]),
+        ("se", ["se 名称", "se name", "se_name", "sales executive", "se"]),
+        ("shop", ["store code", "商店代码", "store_code", "shop name"]),
+        ("model", ["model name", "model_name", "model"]),
+    ]
+
+    for dim_name, kws in dim_specs:
+      k_col = find_col(tmp, kws)
+      if k_col:
+        sub = pd.DataFrame({
+            "_k": norm_compact_key(tmp[k_col]),
+            "_t": tgt_vals,
+        })
+        sub = sub[sub["_k"] != ""]
+        if not sub.empty:
+          grp = sub.groupby("_k", as_index=False)["_t"].sum()
+          s_map = dict(zip(grp["_k"], grp["_t"]))
+          if dim_name not in maps:
+            maps[dim_name] = s_map
+          else:
+            for kk, vv in s_map.items():
+              maps[dim_name][kk] = maps[dim_name].get(kk, 0.0) + vv
+
+  return maps
 
 
 df_sales = (
@@ -172,9 +217,8 @@ df_sales = (
 )
 df_inv = clean_cols(read_excel_safe(inv_up.getvalue())) if inv_up else None
 df_shop = load_shop_df(shop_up) if shop_up else None
-df_target = load_target_df(target_up) if target_up else None
+df_target = load_target_maps(target_up) if target_up else {}
 
-# Shop তথ্য Sales এবং Inventory-তে যুক্ত করা
 for tag, d in [("sales", df_sales), ("inv", df_inv)]:
   if d is not None:
     q_col = find_col(d, ["quantity", "qty", "stock"])
@@ -216,7 +260,6 @@ def get_days(df_s):
 
 
 def extract_group_cols(q, df_list):
-  """কমান্ড থেকে এক বা একাধিক গ্রুপ কলাম খুঁজে বের করে (যেমন shop + model, md, se, asm ইত্যাদি)"""
   pool = []
   for d in df_list:
     if d is not None:
@@ -225,7 +268,10 @@ def extract_group_cols(q, df_list):
           pool.append(c)
 
   alias_map = [
-      (["shop", "store", "দোকান", "শপ"], ["shop name", "商店名称", "store code", "商店代码"]),
+      (
+          ["shop", "store", "দোকান", "শপ"],
+          ["shop name", "商店名称", "store code", "商店代码"],
+      ),
       (["model", "মডেল", "product", "পণ্য"], ["model name", "model"]),
       (["md", "এমডি", "distributor"], ["md name", "md code"]),
       (["se", "এসই", "sales executive"], ["se 名称", "se name", "se_name", "se"]),
@@ -235,15 +281,16 @@ def extract_group_cols(q, df_list):
   ]
 
   found = []
-  # ১. সরাসরি কলামের নাম কমান্ডে থাকলে
   for c in pool:
     cl = str(c).lower().strip()
     if len(cl) > 1 and cl in q and c not in found:
       found.append(c)
 
-  # ২. Alias শব্দ কমান্ডে থাকলে
   for kws, col_kws in alias_map:
-    if any(re.search(rf"\b{re.escape(k)}\b", q) or (not k.isascii() and k in q) for k in kws):
+    if any(
+        re.search(rf"\b{re.escape(k)}\b", q) or (not k.isascii() and k in q)
+        for k in kws
+    ):
       for kw in col_kws:
         matched = next((c for c in pool if kw in str(c).lower()), None)
         if matched and matched not in found:
@@ -254,7 +301,6 @@ def extract_group_cols(q, df_list):
 
 
 def apply_filters(df, q):
-  """কমান্ডে কোনো কলামের মান উল্লেখ থাকলে সে অনুযায়ী ফিল্টার করে"""
   if df is None or df.empty or not q:
     return df
   out = df.copy()
@@ -263,7 +309,6 @@ def apply_filters(df, q):
       continue
     if out[c].dtype == object or str(out[c].dtype).startswith("string"):
       vals = out[c].dropna().astype(str).str.strip().unique()
-      # খুব বেশি ইউনিক ভ্যালু থাকলে স্ক্যান বাদ দিয়ে গতি ঠিক রাখা
       if 1 < len(vals) <= 300:
         for v in vals:
           vl = v.lower().strip()
@@ -298,7 +343,6 @@ def build_dynamic_report(q, df_s, df_i, df_t, days_p):
       k in q for k in ["target", "achievement", "টার্গেট", "অ্যাচিভমেন্ট"]
   )
 
-  # কমান্ডে গ্রুপিং কলাম না বলা থাকলে ডিফল্ট কলাম নির্ধারণ
   if not grp_cols:
     if want_stock and not has_sales and has_inv:
       fallback = find_col(
@@ -320,14 +364,12 @@ def build_dynamic_report(q, df_s, df_i, df_t, days_p):
   if not grp_cols:
     return None, None, None, "Report"
 
-  # যে কলামগুলো গ্রুপিং হবে সেগুলোর নরম্যালাইজড কী তৈরি
   def prep_grouped(df, g_cols, qty_alias, amt_alias=None, shop_alias=None):
     tmp = df.copy()
     key_cols = []
     disp_cols = []
     for idx, gc in enumerate(g_cols):
       if gc not in tmp.columns:
-        # একই অর্থের কলাম অন্য নামে থাকলে খুঁজে নেওয়া
         alt = None
         gl = str(gc).lower()
         if "shop" in gl or "store" in gl or "商店" in gl:
@@ -365,20 +407,27 @@ def build_dynamic_report(q, df_s, df_i, df_t, days_p):
     grouped = tmp.groupby(key_cols, as_index=False).agg(**agg_dict)
     return grouped, key_cols, disp_cols
 
-  # Sales ও Inventory একসাথে দরকার এমন কমান্ড (Turnover / Stock Need / উভয় ডেটা থাকলে)
-  need_both = want_turnover or ("need" in q) or (has_sales and has_inv and want_stock and not want_target)
+  need_both = (
+      want_turnover
+      or ("need" in q)
+      or (has_sales and has_inv and want_stock and not want_target)
+  )
 
   if need_both and has_sales and has_inv:
     s_grp, s_keys, s_disps = prep_grouped(
         s_sub, grp_cols, "Sales_Qty", "Sales_Amount", "Active_Shops"
     )
-    i_grp, i_keys, i_disps = prep_grouped(i_sub, grp_cols, "Stock_Qty", None, None)
+    i_grp, i_keys, i_disps = prep_grouped(
+        i_sub, grp_cols, "Stock_Qty", None, None
+    )
 
-    merged = pd.merge(i_grp, s_grp, on=s_keys, how="outer", suffixes=("_inv", "_sls"))
+    merged = pd.merge(
+        i_grp, s_grp, on=s_keys, how="outer", suffixes=("_inv", "_sls")
+    )
     merged["Stock_Qty"] = to_num(merged["Stock_Qty"])
     merged["Sales_Qty"] = to_num(merged["Sales_Qty"])
 
-    for idx, dk in enumerate(s_disps):
+    for dk in s_disps:
       c_sls = dk if dk in merged.columns else f"{dk}_sls"
       c_inv = f"{dk}_inv"
       if c_sls in merged.columns and c_inv in merged.columns:
@@ -424,7 +473,6 @@ def build_dynamic_report(q, df_s, df_i, df_t, days_p):
     )
     return merged, x_c, y_c, t_str
 
-  # শুধুমাত্র Stock / Inventory রিপোর্ট
   if want_stock and has_inv:
     i_grp, i_keys, i_disps = prep_grouped(i_sub, grp_cols, "Stock_Qty")
     if len(i_disps) > 1:
@@ -437,23 +485,38 @@ def build_dynamic_report(q, df_s, df_i, df_t, days_p):
     )
     return i_grp, x_c, "Stock_Qty", f"Stock by {' + '.join(i_disps)}"
 
-  # Sales / Target vs Achievement / যেকোনো কমান্ড
   if has_sales:
     s_grp, s_keys, s_disps = prep_grouped(
         s_sub, grp_cols, "Sales_Qty", "Sales_Amount", "Active_Shops"
     )
-    if df_t is not None and not df_t.empty:
-      tk = s_keys[0]
-      s_grp = pd.merge(
-          s_grp, df_t, left_on=tk, right_on="_tgt_key", how="left"
-      )
-      s_grp["Target_Qty"] = to_num(s_grp["Target_Qty"])
+    if df_t:
+      g_lower = str(grp_cols[0]).lower()
+      if "asm" in g_lower and "asm" in df_t:
+        t_dict = df_t["asm"]
+      elif ("se" in g_lower or "名称" in g_lower) and "se" in df_t:
+        t_dict = df_t["se"]
+      elif (
+          "shop" in g_lower or "store" in g_lower or "商店" in g_lower
+      ) and "shop" in df_t:
+        t_dict = df_t["shop"]
+      elif "model" in g_lower and "model" in df_t:
+        t_dict = df_t["model"]
+      else:
+        t_dict = (
+            df_t.get("se")
+            or df_t.get("asm")
+            or df_t.get("shop")
+            or df_t.get("model")
+            or {}
+        )
+
+      clean_keys = norm_compact_key(s_grp[s_disps[0]])
+      s_grp["Target_Qty"] = [float(t_dict.get(k, 0.0)) for k in clean_keys]
       s_grp["Achievement_%"] = np.where(
           s_grp["Target_Qty"] > 0,
           np.round((s_grp["Sales_Qty"] / s_grp["Target_Qty"]) * 100, 2),
           0.0,
       )
-      s_grp = s_grp.drop(columns=["_tgt_key"], errors="ignore")
 
     if len(s_disps) > 1:
       s_grp["Label"] = s_grp[s_disps].astype(str).agg(" | ".join, axis=1)
@@ -481,9 +544,8 @@ st.markdown("### 💬 কমান্ড বক্স (যেকোনো রি
 cmd = st.text_input(
     "কমান্ড লিখুন",
     placeholder=(
-        "যা চাইবেন লিখুন — যেমন: Shop Model Wise Turn Over days, MD Stock"
-        " Need, SE Wise Target vs Achievement, ASM wise sales, Model wise stock"
-        " ইত্যাদি"
+        "যা চাইবেন লিখুন — যেমন: ASM Wise Target Vs Achievement, SE Wise"
+        " Target Vs Achievement, Shop Model Wise Turn Over days, MD Stock Need"
     ),
 )
 
