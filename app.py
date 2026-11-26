@@ -1,4 +1,6 @@
 import io
+import re
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -23,7 +25,7 @@ if not st.session_state.auth:
         st.error("Username অথবা Password সঠিক নয়।")
   st.stop()
 
-st.title("📊 vivo NJ Region — Sales, Inventory & Report Generator")
+st.title("📊 vivo NJ Region — Dynamic Excel Report Generator")
 
 with st.sidebar:
   st.header("📁 ফাইল আপলোড")
@@ -47,15 +49,15 @@ def clean_cols(df):
   df = df.copy()
   df.columns = [str(c).strip() for c in df.columns]
   seen = {}
-  unique_cols = []
+  out = []
   for c in df.columns:
     if c in seen:
       seen[c] += 1
-      unique_cols.append(f"{c}_{seen[c]}")
+      out.append(f"{c}_{seen[c]}")
     else:
       seen[c] = 0
-      unique_cols.append(c)
-  df.columns = unique_cols
+      out.append(c)
+  df.columns = out
   return df
 
 
@@ -65,11 +67,21 @@ def norm_key(series):
       .astype(str)
       .str.replace(r"\.0$", "", regex=True)
       .str.strip()
+      .str.lower()
+  )
+
+
+def norm_disp(series):
+  return (
+      series.fillna("")
+      .astype(str)
+      .str.replace(r"\.0$", "", regex=True)
+      .str.strip()
   )
 
 
 def to_num(series):
-  return pd.to_numeric(series, errors="coerce").fillna(0)
+  return pd.to_numeric(series, errors="coerce").fillna(0.0)
 
 
 def find_col(df, keywords):
@@ -98,34 +110,22 @@ def load_shop_df(file):
   if file is None:
     return None
   raw = file.getvalue()
-  df = clean_cols(read_excel_safe(raw, sheet_name="NJ Shop Information", header=1))
+  df = clean_cols(
+      read_excel_safe(raw, sheet_name="NJ Shop Information", header=1)
+  )
   store_col = find_col(df, ["store code", "商店代码", "store_code"])
   if not store_col:
     return None
-
-  keep_cols = [store_col]
-  for kw in [
-      "shop name",
-      "se ",
-      "se_name",
-      "asm",
-      "rsm",
-      "business area",
-      "upazola",
-      "thana",
-      "md name",
-      "md code",
-  ]:
-    col = find_col(df, [kw])
-    if col and col not in keep_cols:
-      keep_cols.append(col)
-
-  out = df[keep_cols].copy()
+  keep = [store_col]
+  for c in df.columns:
+    if c not in keep:
+      keep.append(c)
+  out = df[keep].copy()
   out["_store_key"] = norm_key(out[store_col])
-  out = out[out["_store_key"] != ""].drop_duplicates(
+  out[store_col] = norm_disp(out[store_col])
+  return out[out["_store_key"] != ""].drop_duplicates(
       subset=["_store_key"], keep="first"
   )
-  return out
 
 
 def load_target_df(file):
@@ -140,13 +140,12 @@ def load_target_df(file):
     if all(str(c).startswith("Unnamed") for c in tmp.columns) and len(tmp) > 0:
       tmp.columns = [str(x).strip() for x in tmp.iloc[0]]
       tmp = clean_cols(tmp.iloc[1:].reset_index(drop=True))
-
     key_col = find_col(
         tmp,
         [
+            "se 名称",
             "se name",
             "se_name",
-            "se ",
             "sales executive",
             "store code",
             "商店代码",
@@ -175,15 +174,13 @@ df_inv = clean_cols(read_excel_safe(inv_up.getvalue())) if inv_up else None
 df_shop = load_shop_df(shop_up) if shop_up else None
 df_target = load_target_df(target_up) if target_up else None
 
-# Shop তথ্য Sales ও Inventory-তে নিরাপদে যুক্ত করা
+# Shop তথ্য Sales এবং Inventory-তে যুক্ত করা
 for tag, d in [("sales", df_sales), ("inv", df_inv)]:
   if d is not None:
     q_col = find_col(d, ["quantity", "qty", "stock"])
     d["_qty"] = to_num(d[q_col]) if q_col else 1.0
-
     a_col = find_col(d, ["sales amount", "amount", "value", "revenue"])
     d["_amt"] = to_num(d[a_col]) if a_col else 0.0
-
     s_col = find_col(d, ["store code", "商店代码", "store_code"])
     if s_col:
       d["_store_key"] = norm_key(d[s_col])
@@ -200,14 +197,13 @@ for tag, d in [("sales", df_sales), ("inv", df_inv)]:
               on="_store_key",
               how="left",
           )
-
     if tag == "sales":
       df_sales = d
     else:
       df_inv = d
 
 
-def detect_period_days(df_s):
+def get_days(df_s):
   if df_s is not None:
     dt_col = find_col(df_s, ["sales date", "date"])
     if dt_col:
@@ -219,248 +215,294 @@ def detect_period_days(df_s):
   return 30
 
 
-def detect_group_col(q, df_s, df_i):
-  # কমান্ডে যে ডাইমেনশন চাওয়া হয়েছে সেটি আগে খোঁজা হবে
-  rules = [
-      (["shop", "store", "দোকান", "শপ"], ["shop name", "_store_key"]),
-      (["md", "এমডি", "distributor", "ডিস্ট্রিবিউটর"], ["md name", "md code"]),
+def extract_group_cols(q, df_list):
+  """কমান্ড থেকে এক বা একাধিক গ্রুপ কলাম খুঁজে বের করে (যেমন shop + model, md, se, asm ইত্যাদি)"""
+  pool = []
+  for d in df_list:
+    if d is not None:
+      for c in d.columns:
+        if not str(c).startswith("_") and c not in pool:
+          pool.append(c)
+
+  alias_map = [
+      (["shop", "store", "দোকান", "শপ"], ["shop name", "商店名称", "store code", "商店代码"]),
       (["model", "মডেল", "product", "পণ্য"], ["model name", "model"]),
+      (["md", "এমডি", "distributor"], ["md name", "md code"]),
+      (["se", "এসই", "sales executive"], ["se 名称", "se name", "se_name", "se"]),
       (["asm", "এএসএম"], ["asm name", "asm"]),
       (["rsm", "আরএসএম"], ["rsm name", "rsm"]),
       (["area", "এরিয়া", "thana", "upazila"], ["business area", "upazola"]),
-      (
-          ["se", "এসই", "target", "টার্গেট", "achievement"],
-          ["se name", "se_name", "se ", "md name", "model name"],
-      ),
   ]
-  for kws, col_kws in rules:
-    if any(k in q for k in kws):
-      for d in [df_s, df_i]:
-        col = find_col(d, col_kws)
-        if col:
-          return col
 
-  # কমান্ডে নির্দিষ্ট শব্দ না থাকলে উপলব্ধ কলাম থেকেই একটি বেছে নেওয়া
-  for d in [df_s, df_i]:
-    for col_kws in [
-        ["se name", "se ", "md name", "model name", "shop name", "_store_key"]
-    ]:
-      col = find_col(d, col_kws)
-      if col:
-        return col
-  return None
+  found = []
+  # ১. সরাসরি কলামের নাম কমান্ডে থাকলে
+  for c in pool:
+    cl = str(c).lower().strip()
+    if len(cl) > 1 and cl in q and c not in found:
+      found.append(c)
 
+  # ২. Alias শব্দ কমান্ডে থাকলে
+  for kws, col_kws in alias_map:
+    if any(re.search(rf"\b{re.escape(k)}\b", q) or (not k.isascii() and k in q) for k in kws):
+      for kw in col_kws:
+        matched = next((c for c in pool if kw in str(c).lower()), None)
+        if matched and matched not in found:
+          found.append(matched)
+          break
 
-def group_sum(df, g_col, val_col, out_name):
-  grp_vals = df[g_col].fillna("Unmapped").astype(str).str.strip()
-  res = df.groupby(grp_vals, as_index=False)[val_col].sum()
-  res.columns = [g_col, out_name]
-  return res
+  return found
 
 
-st.markdown("### 💬 কমান্ড বক্স (বাংলা বা ইংরেজিতে লিখুন)")
+def apply_filters(df, q):
+  """কমান্ডে কোনো কলামের মান উল্লেখ থাকলে সে অনুযায়ী ফিল্টার করে"""
+  if df is None or df.empty or not q:
+    return df
+  out = df.copy()
+  for c in out.columns:
+    if str(c).startswith("_"):
+      continue
+    if out[c].dtype == object or str(out[c].dtype).startswith("string"):
+      vals = out[c].dropna().astype(str).str.strip().unique()
+      # খুব বেশি ইউনিক ভ্যালু থাকলে স্ক্যান বাদ দিয়ে গতি ঠিক রাখা
+      if 1 < len(vals) <= 300:
+        for v in vals:
+          vl = v.lower().strip()
+          if len(vl) >= 3 and re.search(rf"\b{re.escape(vl)}\b", q):
+            out = out[out[c].astype(str).str.strip().str.lower() == vl]
+            break
+  return out
+
+
+def top_n_from_cmd(q, default_n=None):
+  m = re.search(r"\b(?:top|first)\s+(\d+)\b", q)
+  if m:
+    return int(m.group(1))
+  return default_n
+
+
+def build_dynamic_report(q, df_s, df_i, df_t, days_p):
+  s_sub = apply_filters(df_s, q)
+  i_sub = apply_filters(df_i, q)
+
+  grp_cols = extract_group_cols(q, [s_sub, i_sub])
+  has_sales = s_sub is not None and not s_sub.empty
+  has_inv = i_sub is not None and not i_sub.empty
+
+  want_turnover = any(
+      k in q for k in ["turnover", "turn over", "turnaround", "টার্নওভার"]
+  )
+  want_stock = any(
+      k in q for k in ["stock", "inventory", "need", "স্টক", "ইনভেন্টরি"]
+  )
+  want_target = any(
+      k in q for k in ["target", "achievement", "টার্গেট", "অ্যাচিভমেন্ট"]
+  )
+
+  # কমান্ডে গ্রুপিং কলাম না বলা থাকলে ডিফল্ট কলাম নির্ধারণ
+  if not grp_cols:
+    if want_stock and not has_sales and has_inv:
+      fallback = find_col(
+          i_sub, ["model name", "se 名称", "se name", "md name", "shop name"]
+      )
+    elif has_sales:
+      fallback = find_col(
+          s_sub, ["se 名称", "se name", "model name", "md name", "shop name"]
+      )
+    elif has_inv:
+      fallback = find_col(
+          i_sub, ["model name", "se 名称", "se name", "md name", "shop name"]
+      )
+    else:
+      fallback = None
+    if fallback:
+      grp_cols = [fallback]
+
+  if not grp_cols:
+    return None, None, None, "Report"
+
+  # যে কলামগুলো গ্রুপিং হবে সেগুলোর নরম্যালাইজড কী তৈরি
+  def prep_grouped(df, g_cols, qty_alias, amt_alias=None, shop_alias=None):
+    tmp = df.copy()
+    key_cols = []
+    disp_cols = []
+    for idx, gc in enumerate(g_cols):
+      if gc not in tmp.columns:
+        # একই অর্থের কলাম অন্য নামে থাকলে খুঁজে নেওয়া
+        alt = None
+        gl = str(gc).lower()
+        if "shop" in gl or "store" in gl or "商店" in gl:
+          alt = find_col(tmp, ["shop name", "store code", "商店代码"])
+        elif "model" in gl:
+          alt = find_col(tmp, ["model name", "model"])
+        elif "md" in gl:
+          alt = find_col(tmp, ["md name", "md code"])
+        elif "se" in gl:
+          alt = find_col(tmp, ["se 名称", "se name", "se"])
+        if alt:
+          gc_use = alt
+        else:
+          gc_use = f"_g_{idx}"
+          tmp[gc_use] = "All"
+      else:
+        gc_use = gc
+
+      k_name = f"_gk_{idx}"
+      d_name = gc if gc not in key_cols else f"{gc}_{idx}"
+      tmp[k_name] = norm_key(tmp[gc_use])
+      tmp[d_name] = norm_disp(tmp[gc_use]).replace("", "Unmapped")
+      key_cols.append(k_name)
+      disp_cols.append(d_name)
+
+    agg_dict = {qty_alias: ("_qty", "sum")}
+    if amt_alias and "_amt" in tmp.columns:
+      agg_dict[amt_alias] = ("_amt", "sum")
+    if shop_alias and "_store_key" in tmp.columns:
+      agg_dict[shop_alias] = ("_store_key", "nunique")
+
+    for d_name in disp_cols:
+      agg_dict[d_name] = (d_name, "first")
+
+    grouped = tmp.groupby(key_cols, as_index=False).agg(**agg_dict)
+    return grouped, key_cols, disp_cols
+
+  # Sales ও Inventory একসাথে দরকার এমন কমান্ড (Turnover / Stock Need / উভয় ডেটা থাকলে)
+  need_both = want_turnover or ("need" in q) or (has_sales and has_inv and want_stock and not want_target)
+
+  if need_both and has_sales and has_inv:
+    s_grp, s_keys, s_disps = prep_grouped(
+        s_sub, grp_cols, "Sales_Qty", "Sales_Amount", "Active_Shops"
+    )
+    i_grp, i_keys, i_disps = prep_grouped(i_sub, grp_cols, "Stock_Qty", None, None)
+
+    merged = pd.merge(i_grp, s_grp, on=s_keys, how="outer", suffixes=("_inv", "_sls"))
+    merged["Stock_Qty"] = to_num(merged["Stock_Qty"])
+    merged["Sales_Qty"] = to_num(merged["Sales_Qty"])
+
+    for idx, dk in enumerate(s_disps):
+      c_sls = dk if dk in merged.columns else f"{dk}_sls"
+      c_inv = f"{dk}_inv"
+      if c_sls in merged.columns and c_inv in merged.columns:
+        merged[dk] = (
+            norm_disp(merged[c_sls])
+            .where(norm_key(merged[c_sls]) != "", norm_disp(merged[c_inv]))
+            .replace("", "Unmapped")
+        )
+        for drop_c in [c_sls, c_inv]:
+          if drop_c != dk and drop_c in merged.columns:
+            merged = merged.drop(columns=[drop_c])
+      elif c_inv in merged.columns and dk not in merged.columns:
+        merged[dk] = norm_disp(merged[c_inv]).replace("", "Unmapped")
+        merged = merged.drop(columns=[c_inv], errors="ignore")
+
+    if want_turnover:
+      merged["Daily_Sales"] = (merged["Sales_Qty"] / days_p).round(2)
+      merged["Turnover_Days"] = np.where(
+          merged["Sales_Qty"] > 0,
+          np.round((merged["Stock_Qty"] / merged["Sales_Qty"]) * days_p, 1),
+          0.0,
+      )
+      sort_col = "Turnover_Days"
+      y_c = "Turnover_Days"
+      t_str = f"Turnover Days ({days_p} Days) by {' + '.join(s_disps)}"
+    else:
+      merged["Stock_Need"] = np.maximum(
+          merged["Sales_Qty"] - merged["Stock_Qty"], 0.0
+      )
+      merged["Stock_Diff"] = merged["Stock_Qty"] - merged["Sales_Qty"]
+      sort_col = "Stock_Need" if "need" in q else "Stock_Qty"
+      y_c = "Stock_Qty"
+      t_str = f"Stock vs Sales by {' + '.join(s_disps)}"
+
+    if len(s_disps) > 1:
+      merged["Label"] = merged[s_disps].astype(str).agg(" | ".join, axis=1)
+      x_c = "Label"
+    else:
+      x_c = s_disps[0]
+
+    merged = merged.drop(columns=s_keys, errors="ignore").sort_values(
+        by=sort_col, ascending=False
+    )
+    return merged, x_c, y_c, t_str
+
+  # শুধুমাত্র Stock / Inventory রিপোর্ট
+  if want_stock and has_inv:
+    i_grp, i_keys, i_disps = prep_grouped(i_sub, grp_cols, "Stock_Qty")
+    if len(i_disps) > 1:
+      i_grp["Label"] = i_grp[i_disps].astype(str).agg(" | ".join, axis=1)
+      x_c = "Label"
+    else:
+      x_c = i_disps[0]
+    i_grp = i_grp.drop(columns=i_keys, errors="ignore").sort_values(
+        by="Stock_Qty", ascending=False
+    )
+    return i_grp, x_c, "Stock_Qty", f"Stock by {' + '.join(i_disps)}"
+
+  # Sales / Target vs Achievement / যেকোনো কমান্ড
+  if has_sales:
+    s_grp, s_keys, s_disps = prep_grouped(
+        s_sub, grp_cols, "Sales_Qty", "Sales_Amount", "Active_Shops"
+    )
+    if df_t is not None and not df_t.empty:
+      tk = s_keys[0]
+      s_grp = pd.merge(
+          s_grp, df_t, left_on=tk, right_on="_tgt_key", how="left"
+      )
+      s_grp["Target_Qty"] = to_num(s_grp["Target_Qty"])
+      s_grp["Achievement_%"] = np.where(
+          s_grp["Target_Qty"] > 0,
+          np.round((s_grp["Sales_Qty"] / s_grp["Target_Qty"]) * 100, 2),
+          0.0,
+      )
+      s_grp = s_grp.drop(columns=["_tgt_key"], errors="ignore")
+
+    if len(s_disps) > 1:
+      s_grp["Label"] = s_grp[s_disps].astype(str).agg(" | ".join, axis=1)
+      x_c = "Label"
+    else:
+      x_c = s_disps[0]
+
+    s_grp = s_grp.drop(columns=s_keys, errors="ignore").sort_values(
+        by="Sales_Qty", ascending=False
+    )
+    return s_grp, x_c, "Sales_Qty", f"Sales Report by {' + '.join(s_disps)}"
+
+  if has_inv:
+    i_grp, i_keys, i_disps = prep_grouped(i_sub, grp_cols, "Stock_Qty")
+    x_c = i_disps[0]
+    i_grp = i_grp.drop(columns=i_keys, errors="ignore").sort_values(
+        by="Stock_Qty", ascending=False
+    )
+    return i_grp, x_c, "Stock_Qty", f"Stock Report by {' + '.join(i_disps)}"
+
+  return None, None, None, "Report"
+
+
+st.markdown("### 💬 কমান্ড বক্স (যেকোনো রিপোর্ট বা কলামের নাম লিখুন)")
 cmd = st.text_input(
     "কমান্ড লিখুন",
     placeholder=(
-        "যেমন: Shop Wise Turn Over Days / MD Stock Need / SE Wise Target vs"
-        " Achievement / Model wise sales"
+        "যা চাইবেন লিখুন — যেমন: Shop Model Wise Turn Over days, MD Stock"
+        " Need, SE Wise Target vs Achievement, ASM wise sales, Model wise stock"
+        " ইত্যাদি"
     ),
 )
 
 c1, c2 = st.columns(2)
-report = None
-x_col, y_col, chart_title = None, None, "Report"
+report, x_col, y_col, chart_title = None, None, None, "Report"
 
 q = (cmd or "").strip().lower()
-days_period = detect_period_days(df_sales)
+days_period = get_days(df_sales)
 
 if df_sales is not None or df_inv is not None:
   try:
-    is_turnover = any(
-        k in q for k in ["turnover", "turn over", "turnaround", "টার্নওভার"]
+    report, x_col, y_col, chart_title = build_dynamic_report(
+        q, df_sales, df_inv, df_target, days_period
     )
-    is_stock_q = any(
-        k in q for k in ["stock", "inventory", "need", "স্টক", "ইনভেন্টরি"]
-    )
-    is_shop_q = any(
-        k in q for k in ["shop", "store", "দোকান", "শপ"]
-    )
-    is_md_q = any(
-        k in q for k in ["md", "এমডি", "distributor", "ডিস্ট্রিবিউটর"]
-    )
-
-    # ১. Turnover Days রিপোর্ট (Shop বা যেকোনো লেভেলে)
-    if is_turnover and df_sales is not None and df_inv is not None:
-      s_key = "_store_key" if "_store_key" in df_sales.columns else None
-      i_key = "_store_key" if "_store_key" in df_inv.columns else None
-
-      if s_key and i_key:
-        s_grp = (
-            df_sales.groupby(s_key, as_index=False)["_qty"]
-            .sum()
-            .rename(columns={"_qty": "Sales_Qty"})
-        )
-        i_grp = (
-            df_inv.groupby(i_key, as_index=False)["_qty"]
-            .sum()
-            .rename(columns={"_qty": "Stock_Qty"})
-        )
-        m = pd.merge(i_grp, s_grp, on="_store_key", how="outer")
-        m["Stock_Qty"] = to_num(m["Stock_Qty"])
-        m["Sales_Qty"] = to_num(m["Sales_Qty"])
-
-        meta_cols = ["_store_key"]
-        for src in [df_inv, df_sales]:
-          if src is not None and "_store_key" in src.columns:
-            for kw in ["shop name", "se ", "se_name", "md name", "asm"]:
-              mc = find_col(src, [kw])
-              if mc and mc not in meta_cols:
-                meta_cols.append(mc)
-        if len(meta_cols) > 1:
-          src_m = df_inv if df_inv is not None else df_sales
-          m = pd.merge(
-              m,
-              src_m[meta_cols].drop_duplicates(subset=["_store_key"]),
-              on="_store_key",
-              how="left",
-          )
-
-        m["Daily_Sales"] = (m["Sales_Qty"] / days_period).round(2)
-        m["Turnover_Days"] = [
-            round((stk / sls) * days_period, 1) if sls > 0 else 0.0
-            for stk, sls in zip(m["Stock_Qty"], m["Sales_Qty"])
-        ]
-
-        # MD বা SE অনুযায়ী চাইলে গ্রুপিং করে দেওয়া
-        if is_md_q and find_col(m, ["md name"]):
-          md_c = find_col(m, ["md name"])
-          report = (
-              m.groupby(
-                  m[md_c].fillna("Unmapped").astype(str).str.strip(),
-                  as_index=False,
-              )[["Stock_Qty", "Sales_Qty", "Daily_Sales"]]
-              .sum()
-          )
-          report.columns = [md_c, "Stock_Qty", "Sales_Qty", "Daily_Sales"]
-          report["Turnover_Days"] = [
-              round((stk / sls) * days_period, 1) if sls > 0 else 0.0
-              for stk, sls in zip(report["Stock_Qty"], report["Sales_Qty"])
-          ]
-          report = report.sort_values(by="Turnover_Days", ascending=False)
-          x_col, y_col, chart_title = (
-              md_c,
-              "Turnover_Days",
-              f"MD Wise Turnover Days ({days_period} Days)",
-          )
-        else:
-          lbl = find_col(m, ["shop name"]) or "_store_key"
-          report = m.sort_values(by="Turnover_Days", ascending=False)
-          x_col, y_col, chart_title = (
-              lbl,
-              "Turnover_Days",
-              f"Shop Wise Turnover Days ({days_period} Days)",
-          )
-
-    # ২. MD Stock Need / MD Stock রিপোর্ট
-    elif is_md_q and is_stock_q:
-      md_i = find_col(df_inv, ["md name", "md code"])
-      md_s = find_col(df_sales, ["md name", "md code"])
-
-      if df_inv is not None and md_i:
-        inv_m = group_sum(df_inv, md_i, "_qty", "Stock_Qty")
-        inv_m["_k"] = norm_key(inv_m[md_i])
-
-        if df_sales is not None and md_s:
-          sls_m = group_sum(df_sales, md_s, "_qty", "Sales_Qty")
-          sls_m["_k"] = norm_key(sls_m[md_s])
-          m = pd.merge(
-              inv_m, sls_m[["_k", "Sales_Qty"]], on="_k", how="left"
-          )
-          m["Sales_Qty"] = to_num(m["Sales_Qty"])
-          m["Stock_Need"] = (m["Sales_Qty"] - m["Stock_Qty"]).clip(lower=0)
-          m["Stock_vs_Sales_Diff"] = m["Stock_Qty"] - m["Sales_Qty"]
-          report = m.drop(columns=["_k"]).sort_values(
-              by=["Stock_Need", "Stock_Qty"], ascending=[False, False]
-          )
-          x_col, y_col, chart_title = (
-              md_i,
-              "Stock_Qty",
-              "MD Wise Stock vs Sales",
-          )
-        else:
-          report = inv_m.drop(columns=["_k"]).sort_values(
-              by="Stock_Qty", ascending=False
-          )
-          x_col, y_col, chart_title = md_i, "Stock_Qty", "MD Wise Stock"
-
-    # ৩. যেকোনো Stock / Inventory কমান্ড
-    elif is_stock_q and df_inv is not None:
-      g_col = detect_group_col(q, None, df_inv)
-      if g_col:
-        report = group_sum(df_inv, g_col, "_qty", "Stock_Qty").sort_values(
-            by="Stock_Qty", ascending=False
-        )
-        if df_sales is not None:
-          s_g = detect_group_col(q, df_sales, None)
-          if s_g:
-            s_m = group_sum(df_sales, s_g, "_qty", "Sales_Qty")
-            s_m["_k"] = norm_key(s_m[s_g])
-            report["_k"] = norm_key(report[g_col])
-            report = pd.merge(
-                report, s_m[["_k", "Sales_Qty"]], on="_k", how="left"
-            )
-            report["Sales_Qty"] = to_num(report["Sales_Qty"])
-            report["Stock_Need"] = (
-                report["Sales_Qty"] - report["Stock_Qty"]
-            ).clip(lower=0)
-            report = report.drop(columns=["_k"], errors="ignore")
-        x_col, y_col, chart_title = g_col, "Stock_Qty", f"Stock by {g_col}"
-
-    # ৪. Sales / Target / SE / Model / Shop বা অন্য যেকোনো কমান্ড
-    elif df_sales is not None:
-      g_col = detect_group_col(q, df_sales, df_inv)
-      if g_col:
-        grp_vals = df_sales[g_col].fillna("Unmapped").astype(str).str.strip()
-        agg_spec = {"Sales_Qty": ("_qty", "sum")}
-        if find_col(df_sales, ["sales amount", "amount"]):
-          agg_spec["Sales_Amount"] = ("_amt", "sum")
-        if "_store_key" in df_sales.columns:
-          agg_spec["Active_Shops"] = ("_store_key", "nunique")
-
-        report = (
-            df_sales.groupby(grp_vals, as_index=False)
-            .agg(**agg_spec)
-            .sort_values(by="Sales_Qty", ascending=False)
-        )
-        report = report.rename(columns={report.columns[0]: g_col})
-
-        if df_target is not None:
-          report["_tk"] = norm_key(report[g_col])
-          report = pd.merge(report, df_target, on="_tk", how="left")
-          report["Target_Qty"] = to_num(report["Target_Qty"])
-          report["Achievement_%"] = [
-              round((s / t) * 100, 2) if t > 0 else 0.0
-              for s, t in zip(report["Sales_Qty"], report["Target_Qty"])
-          ]
-          report = report.drop(columns=["_tk"], errors="ignore")
-
-        x_col, y_col, chart_title = (
-            g_col,
-            "Sales_Qty",
-            f"Sales Performance by {g_col}",
-        )
-
-    # ৫. শুধু Inventory থাকলে ফলব্যাক Stock রিপোর্ট
-    elif df_inv is not None:
-      g_col = detect_group_col(q, None, df_inv)
-      if g_col:
-        report = group_sum(df_inv, g_col, "_qty", "Stock_Qty").sort_values(
-            by="Stock_Qty", ascending=False
-        )
-        x_col, y_col, chart_title = g_col, "Stock_Qty", f"Stock by {g_col}"
-
+    limit_n = top_n_from_cmd(q)
+    if report is not None and limit_n and limit_n > 0:
+      report = report.head(limit_n)
   except Exception as e:
-    st.info(f"রিপোর্ট প্রসেস করার সময় নোট: {e}")
+    st.info(f"রিপোর্ট তৈরি করার সময় নোট: {e}")
 
 if report is not None and not report.empty:
   with c1:
