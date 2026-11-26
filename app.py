@@ -97,7 +97,6 @@ def load_target_df(file):
   for sh in xls.sheet_names:
     tmp = pd.read_excel(file, sheet_name=sh)
     tmp.columns = [str(c).strip() for c in tmp.columns]
-    # যদি প্রথম রোতে আসল হেডার থাকে
     if all(str(c).startswith("Unnamed") for c in tmp.columns) and len(tmp) > 0:
       tmp.columns = [str(x).strip() for x in tmp.iloc[0]]
       tmp = tmp.iloc[1:].reset_index(drop=True)
@@ -156,14 +155,23 @@ if df_sales is not None:
     df_sales["_store_key"] = norm_key(df_sales[s_store_col])
     df_sales = pd.merge(
         df_sales,
-        df_shop.drop(columns=[c for c in df_shop.columns if "code" in c.lower() or "商店代码" in c], errors="ignore"),
+        df_shop.drop(
+            columns=[
+                c
+                for c in df_shop.columns
+                if "code" in c.lower() or "商店代码" in c
+            ],
+            errors="ignore",
+        ),
         on="_store_key",
         how="left",
     )
   if "SE 名称" not in df_sales.columns:
     df_sales["SE 名称"] = "Unmapped"
   else:
-    df_sales["SE 名称"] = df_sales["SE 名称"].fillna("Unmapped").astype(str).str.strip()
+    df_sales["SE 名称"] = (
+        df_sales["SE 名称"].fillna("Unmapped").astype(str).str.strip()
+    )
 
 if df_inv is not None:
   df_inv.columns = [str(c).strip() for c in df_inv.columns]
@@ -178,21 +186,30 @@ if df_inv is not None:
     df_inv["_store_key"] = norm_key(df_inv[i_store_col])
     df_inv = pd.merge(
         df_inv,
-        df_shop.drop(columns=[c for c in df_shop.columns if "code" in c.lower() or "商店代码" in c], errors="ignore"),
+        df_shop.drop(
+            columns=[
+                c
+                for c in df_shop.columns
+                if "code" in c.lower() or "商店代码" in c
+            ],
+            errors="ignore",
+        ),
         on="_store_key",
         how="left",
     )
   if "SE 名称" not in df_inv.columns:
     df_inv["SE 名称"] = "Unmapped"
   else:
-    df_inv["SE 名称"] = df_inv["SE 名称"].fillna("Unmapped").astype(str).str.strip()
+    df_inv["SE 名称"] = (
+        df_inv["SE 名称"].fillna("Unmapped").astype(str).str.strip()
+    )
 
 st.markdown("### 💬 কমান্ড বক্স (বাংলা বা ইংরেজিতে লিখুন)")
 cmd = st.text_input(
     "কমান্ড লিখুন",
     placeholder=(
-        "যেমন: SE wise target vs achievement দেখাও / Model wise sales / Stock"
-        " summary"
+        "যেমন: MD Stock Need / SE Wise Target vs Achievement / Model wise"
+        " sales"
     ),
 )
 
@@ -203,8 +220,51 @@ x_col, y_col, title = None, None, "Report"
 if cmd or df_sales is not None or df_inv is not None:
   q = (cmd or "").lower()
 
-  # ১. স্টক / ইনভেন্টরি রিপোর্ট
-  if (
+  # ১. MD Stock Need / MD-wise Stock vs Sales
+  if ("md" in q) and (
+      "stock" in q or "inventory" in q or "need" in q or "স্টক" in q
+  ):
+    if df_inv is not None and "MD name" in df_inv.columns:
+      md_stock = (
+          df_inv.groupby("MD name", as_index=False)["Quantity"]
+          .sum()
+          .rename(columns={"Quantity": "Stock_Qty"})
+      )
+      md_stock["_md_key"] = norm_key(md_stock["MD name"])
+
+      if df_sales is not None and "MD name" in df_sales.columns:
+        md_sales = (
+            df_sales.groupby("MD name", as_index=False)["Quantity"]
+            .sum()
+            .rename(columns={"Quantity": "Sales_Qty"})
+        )
+        md_sales["_md_key"] = norm_key(md_sales["MD name"])
+        report = pd.merge(
+            md_stock,
+            md_sales[["_md_key", "Sales_Qty"]],
+            on="_md_key",
+            how="left",
+        )
+        report["Sales_Qty"] = (
+            pd.to_numeric(report["Sales_Qty"], errors="coerce").fillna(0)
+        )
+        # Sales এর তুলনায় Stock ঘাটতি থাকলে Stock_Need পজিটিভ আসবে, নাহলে 0
+        report["Stock_Need"] = (
+            report["Sales_Qty"] - report["Stock_Qty"]
+        ).clip(lower=0)
+        report["Stock_Gap_Net"] = report["Stock_Qty"] - report["Sales_Qty"]
+        report = report.drop(columns=["_md_key"]).sort_values(
+            by=["Stock_Need", "Stock_Qty"], ascending=[False, False]
+        )
+        x_col, y_col, title = "MD name", "Stock_Qty", "MD Wise Stock vs Sales"
+      else:
+        report = md_stock.drop(columns=["_md_key"]).sort_values(
+            by="Stock_Qty", ascending=False
+        )
+        x_col, y_col, title = "MD name", "Stock_Qty", "MD Wise Inventory Stock"
+
+  # ২. সাধারণ স্টক / ইনভেন্টরি রিপোর্ট (Model বা SE)
+  elif (
       ("stock" in q or "inventory" in q or "ইনভেন্টরি" in q or "স্টক" in q)
       and df_inv is not None
   ):
@@ -220,7 +280,7 @@ if cmd or df_sales is not None or df_inv is not None:
     )
     x_col, y_col, title = grp_col, "Quantity", f"Inventory Stock by {grp_col}"
 
-  # ২. মডেল ওয়াইজ সেলস
+  # ৩. মডেল ওয়াইজ সেলস
   elif (
       ("model" in q or "মডেল" in q)
       and df_sales is not None
@@ -236,7 +296,7 @@ if cmd or df_sales is not None or df_inv is not None:
     )
     x_col, y_col, title = "Model name", "Total_Qty", "Model Wise Sales Quantity"
 
-  # ৩. SE ওয়াইজ সেলস ও টার্গেট ভার্সেস অ্যাচিভমেন্ট
+  # ৪. SE ওয়াইজ সেলস ও টার্গেট ভার্সেস অ্যাচিভমেন্ট
   elif df_sales is not None:
     agg_dict = {"Sales_Qty": ("Quantity", "sum")}
     if "Sales amount" in df_sales.columns:
@@ -265,12 +325,6 @@ if cmd or df_sales is not None or df_inv is not None:
 
     report = report.drop(columns=["_se_key"], errors="ignore")
     x_col, y_col, title = "SE 名称", "Sales_Qty", "SE Wise Sales Performance"
-
-  elif df_sales is None and target_up is not None:
-    st.warning(
-        "Target ফাইল যুক্ত হয়েছে, কিন্তু Sales ফাইল আপলোড করা হয়নি। বাম পাশ"
-        " থেকে `Sales.xlsx` আপলোড করুন।"
-    )
 
 if report is not None and not report.empty:
   with c1:
